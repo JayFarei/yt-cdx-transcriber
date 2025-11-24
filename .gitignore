@@ -1,0 +1,6 @@
+# macOS
+.DS_Store
+
+# Python venv cache created by script
+.cache/
+__pycache__/
