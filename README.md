@@ -12,7 +12,6 @@ One-command YouTube audio transcriber that:
 - `codex` CLI (logged in and allowed to use `--dangerously-bypass-approvals-and-sandbox`).
 - `python3`
 - `ffmpeg` (includes `ffprobe`, which the progress heuristics use when available).
-- `gh` only if you plan to publish; not needed to run the script.
 
 ## Install
 ```bash
