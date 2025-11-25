@@ -2,6 +2,189 @@
 set -euo pipefail
 set -o noglob  # avoid zsh-style glob expansion in URLs and paths
 
+progress_bar_width=32
+progress_stage_label=""
+progress_stage_percent=0
+progress_stage_active=false
+progress_line_on_newline=true
+progress_spinner_frames='|/-\\'
+progress_spinner_index=0
+progress_spinner_char=""
+progress_spinner_visible=false
+
+progress_render() {
+  local filled=$(( progress_stage_percent * progress_bar_width / 100 ))
+  local empty=$(( progress_bar_width - filled ))
+  local bar=""
+  local pad=""
+  if (( filled > 0 )); then
+    printf -v bar '%*s' "$filled" ''
+    bar=${bar// /#}
+  fi
+  if (( empty > 0 )); then
+    printf -v pad '%*s' "$empty" ''
+    pad=${pad// /-}
+  fi
+  local tail=""
+  if [[ "$progress_spinner_visible" == true ]]; then
+    tail=" $progress_spinner_char"
+  fi
+  printf '\r%-18s [%s%s] %3d%%%s' "$progress_stage_label" "$bar" "$pad" "$progress_stage_percent" "$tail" >&2
+  progress_line_on_newline=false
+}
+
+progress_start() {
+  progress_stage_label="$1"
+  progress_stage_percent=0
+  progress_stage_active=true
+  progress_spinner_index=0
+  progress_spinner_char=""
+  progress_spinner_visible=false
+  progress_render
+}
+
+progress_update() {
+  local new_value="$1"
+  if [[ "$progress_stage_active" != true ]]; then
+    return
+  fi
+  (( new_value < 0 )) && new_value=0
+  (( new_value > 100 )) && new_value=100
+  if (( new_value == progress_stage_percent )); then
+    return
+  fi
+  progress_stage_percent=$new_value
+  progress_spinner_visible=false
+  progress_render
+}
+
+progress_finish() {
+  if [[ "$progress_stage_active" == true ]]; then
+    progress_update 100
+    printf '\n' >&2
+    progress_line_on_newline=true
+    progress_stage_active=false
+  fi
+}
+
+progress_flush_line() {
+  if [[ "$progress_stage_active" == true && "$progress_line_on_newline" == false ]]; then
+    printf '\n' >&2
+    progress_line_on_newline=true
+  fi
+}
+
+progress_cleanup() {
+  progress_flush_line
+  progress_stage_active=false
+  progress_spinner_visible=false
+}
+
+progress_spinner_tick() {
+  local target="$1"
+  if [[ "$progress_stage_active" != true ]]; then
+    return
+  fi
+  if (( progress_stage_percent < target - 1 )); then
+    if [[ "$progress_spinner_visible" == true ]]; then
+      progress_spinner_visible=false
+      progress_render
+    fi
+    return
+  fi
+  local frames_len=${#progress_spinner_frames}
+  progress_spinner_visible=true
+  progress_spinner_index=$(( (progress_spinner_index + 1) % frames_len ))
+  progress_spinner_char=${progress_spinner_frames:progress_spinner_index:1}
+  progress_render
+}
+
+fake_progress_toward() {
+  local target="$1"
+  if [[ "$progress_stage_active" != true ]]; then
+    return
+  fi
+  if (( target <= progress_stage_percent )); then
+    return
+  fi
+  local cap=$(( target - 1 ))
+  if (( cap <= progress_stage_percent )); then
+    return
+  fi
+  local remaining=$(( cap - progress_stage_percent ))
+  local step=1
+  if (( remaining > 40 )); then
+    step=$(( remaining / 6 ))
+  elif (( remaining > 15 )); then
+    step=3
+  elif (( remaining > 7 )); then
+    step=2
+  fi
+  local next=$(( progress_stage_percent + step ))
+  if (( next > cap )); then
+    next=$cap
+  fi
+  progress_update "$next"
+}
+
+pulse_progress_to() {
+  local target="$1"
+  local interval="${2:-0.08}"
+  if (( target <= progress_stage_percent )); then
+    progress_update "$target"
+    return
+  fi
+  while (( progress_stage_percent < target )); do
+    if (( progress_stage_percent >= target - 1 )); then
+      break
+    fi
+    fake_progress_toward "$target"
+    sleep "$interval"
+  done
+  progress_update "$target"
+}
+
+run_command_with_progress() {
+  local target="$1" log_file="$2"; shift 2
+  : >"$log_file"
+  "$@" >"$log_file" 2>&1 &
+  local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    fake_progress_toward "$target"
+    progress_spinner_tick "$target"
+    sleep 0.25
+  done
+  set +e
+  wait "$pid"
+  local status=$?
+  set -e
+  if (( status != 0 )); then
+    progress_flush_line
+    echo "Step '$progress_stage_label' failed (see $log_file)." >&2
+    tail -n 50 "$log_file" >&2 || true
+    exit "$status"
+  fi
+  progress_update "$target"
+}
+
+yt_dl_with_progress() {
+  local log_file="$1"; shift
+  : >"$log_file"
+  set +e
+  "$@" --newline 2>&1 | while IFS= read -r line; do
+    printf '%s\n' "$line" >>"$log_file"
+    if [[ "$line" =~ \[download\][[:space:]]+([0-9.]+)% ]]; then
+      local pct=${BASH_REMATCH[1]%.*}
+      if [[ -n "$pct" ]]; then
+        progress_update "$pct"
+      fi
+    fi
+  done
+  local status=${PIPESTATUS[0]}
+  set -e
+  return "$status"
+}
+
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <youtube-url>  |  echo <url> | $0 -" >&2
   echo "Tip for zsh: quote the URL or prefix the command with 'noglob'." >&2
@@ -13,90 +196,142 @@ if [[ "$1" == "-" ]]; then
 else
   url="$1"
 fi
-# Remove accidental backslash escapes (common when manually escaping ? and = in zsh)
 url="${url//\\/}"
 
-for dep in yt-dlp codex pbcopy python3; do
+start_seconds=""
+if [[ $url =~ [\?\&]t=([^&#]+) ]]; then
+  tval="${BASH_REMATCH[1]}"
+  if [[ $tval =~ ^([0-9]+)h([0-9]+)m([0-9]+)s?$ ]]; then
+    start_seconds=$(( ${BASH_REMATCH[1]}*3600 + ${BASH_REMATCH[2]}*60 + ${BASH_REMATCH[3]} ))
+  elif [[ $tval =~ ^([0-9]+)m([0-9]+)s?$ ]]; then
+    start_seconds=$(( ${BASH_REMATCH[1]}*60 + ${BASH_REMATCH[2]} ))
+  elif [[ $tval =~ ^([0-9]+)s?$ ]]; then
+    start_seconds="${BASH_REMATCH[1]}"
+  fi
+fi
+
+tmpdir="$(mktemp -d)"
+cleanup() {
+  progress_cleanup
+  if [[ -z "${PRESERVE_TMPDIR:-}" ]]; then
+    rm -rf "$tmpdir"
+  else
+    echo "PRESERVE_TMPDIR=1 set; leaving temp files at $tmpdir" >&2
+  fi
+}
+trap cleanup EXIT
+
+venv_dir="${XDG_CACHE_HOME:-$HOME/.cache}/yt-transcriber-whisper-env"
+progress_start "Environment prep"
+for dep in yt-dlp codex pbcopy python3 ffmpeg; do
   if ! command -v "$dep" >/dev/null 2>&1; then
+    progress_flush_line
     echo "Missing dependency: $dep" >&2
     exit 1
   fi
+  sleep 0.02
+  fake_progress_toward 8
 done
+pulse_progress_to 12
 
-# Reusable whisper venv to keep runs self-contained and fast
-venv_dir="${XDG_CACHE_HOME:-$HOME/.cache}/yt-transcriber-whisper-env"
-python3 -m venv "$venv_dir" >/dev/null 2>&1 || true
+run_command_with_progress 35 "$tmpdir/venv.log" \
+  bash -c 'python3 -m venv "$1" >/dev/null 2>&1 || true' _ "$venv_dir"
 if [[ ! -x "$venv_dir/bin/python" ]]; then
+  progress_flush_line
   echo "Failed to create python venv at $venv_dir" >&2
   exit 1
 fi
+
 if [[ ! -f "$venv_dir/whisper_installed.ok" ]]; then
-  echo "Preparing whisper environment (one-time, downloads whisper model on first run)..."
-  "$venv_dir/bin/python" -m pip install --quiet --upgrade pip >/dev/null 2>&1 || true
-  "$venv_dir/bin/python" -m pip install --quiet openai-whisper >/dev/null
+  run_command_with_progress 55 "$tmpdir/pip-upgrade.log" \
+    "$venv_dir/bin/python" -m pip install --quiet --upgrade pip
+  run_command_with_progress 75 "$tmpdir/whisper-install.log" \
+    "$venv_dir/bin/python" -m pip install --quiet openai-whisper
   touch "$venv_dir/whisper_installed.ok"
+else
+  pulse_progress_to 75
 fi
 
-# Prefetch the small model once to avoid slow downloads chosen by Codex
 if [[ ! -f "$venv_dir/whisper_base_downloaded.ok" ]]; then
-  echo "Fetching Whisper base model (one-time)..."
-  "$venv_dir/bin/python" - <<'PY'
+  run_command_with_progress 100 "$tmpdir/whisper-model.log" \
+    "$venv_dir/bin/python" - <<'PY'
 import whisper
 whisper.load_model("base")
 PY
   touch "$venv_dir/whisper_base_downloaded.ok"
+else
+  pulse_progress_to 100
 fi
+progress_finish
 
-tmpdir="$(mktemp -d)"
-cleanup() { rm -rf "$tmpdir"; }
-trap cleanup EXIT
-
-echo "Downloading audio with yt-dlp..."
-yt-dlp \
-  -q --no-warnings \
-  -f 'bestaudio/best' \
-  -x --audio-format mp3 \
-  -o "$tmpdir/%(title)s.%(ext)s" \
-  "$url" >/dev/null 2>&1
+yt_log="$tmpdir/yt-dlp.log"
+progress_start "Download"
+attempt=1
+max_attempts=2
+while (( attempt <= max_attempts )); do
+  if yt_dl_with_progress "$yt_log" yt-dlp \
+    --no-warnings \
+    --hls-prefer-native \
+    -f 'bestaudio/best' \
+    -x --audio-format mp3 \
+    -o "$tmpdir/%(title)s.%(ext)s" \
+    "$url"; then
+    break
+  fi
+  if (( attempt == max_attempts )); then
+    progress_flush_line
+    echo "yt-dlp failed after $attempt attempt(s). See $yt_log" >&2
+    exit 1
+  fi
+  progress_flush_line
+  echo "yt-dlp failed (attempt $attempt). Retrying..." >&2
+  ((attempt++))
+  progress_start "Download"
+done
+progress_finish
 
 mp3="$(find "$tmpdir" -maxdepth 1 -type f -name '*.mp3' -print -quit)"
 if [[ -z "${mp3:-}" ]]; then
+  progress_flush_line
   echo "No MP3 was created; check the URL and yt-dlp output." >&2
   exit 1
 fi
 
-echo "Transcribing via codex exec..."
+if [[ -n "${start_seconds:-}" ]]; then
+  trimmed_mp3="$tmpdir/trimmed.mp3"
+  if ! ffmpeg -nostdin -loglevel error -y -ss "$start_seconds" -i "$mp3" -acodec copy "$trimmed_mp3"; then
+    progress_flush_line
+    echo "Failed to trim audio at t=$start_seconds seconds." >&2
+    exit 1
+  fi
+  mp3="$trimmed_mp3"
+fi
+
 transcript_file="$tmpdir/transcript.txt"
 codex_log="$tmpdir/codex.log"
-
-set +e
-codex exec \
-  --model gpt-5.1-codex-mini \
-  -c model_reasoning_effort=low \
-  --dangerously-bypass-approvals-and-sandbox \
-  --skip-git-repo-check \
-  --output-last-message "$transcript_file" \
-  "Transcribe the audio file at: $mp3
+progress_start "Transcription"
+run_command_with_progress 100 "$codex_log" \
+  env COD_MP3="$mp3" COD_TRANSCRIPT="$transcript_file" COD_VENV="$venv_dir" COD_LOG="$codex_log" \
+  sh -c '
+    codex exec \
+      --model gpt-5.1-codex-mini \
+      -c model_reasoning_effort=low \
+      --dangerously-bypass-approvals-and-sandbox \
+      --skip-git-repo-check \
+      --output-last-message "$COD_TRANSCRIPT" \
+      "Transcribe the audio file at: $COD_MP3
 
 - Language: English
-- Use the existing Python venv at: $venv_dir
-- Use whisper model='base' only (the model file is pre-downloaded). Do NOT download medium/large.
+- Use the existing Python venv at: $COD_VENV
+- Use whisper model='\''base'\'' only (the model file is pre-downloaded). Do NOT download medium/large.
 - If whisper is missing, install it inside that venv only (do NOT use global pip).
 - Tooling allowed: run shell commands or Python if helpful (e.g., whisper or ffmpeg).
 - Prefer a single Python command to print the transcript; avoid long planning.
 - Output only the final transcript text with no extra commentary." \
-  >"$codex_log" 2>&1
-status=$?
-set -e
-
-if [[ $status -ne 0 ]]; then
-  echo "codex exec failed (exit $status). Log follows:" >&2
-  cat "$codex_log" >&2
-  exit $status
-fi
+      >"$COD_LOG" 2>&1
+  '
+progress_finish
 
 transcript="$(cat "$transcript_file")"
-
 printf "%s\n" "$transcript"
 printf "%s" "$transcript" | pbcopy
-echo "Transcript copied to clipboard."

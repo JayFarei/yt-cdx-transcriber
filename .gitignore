@@ -4,3 +4,12 @@
 # Python venv cache created by script
 .cache/
 __pycache__/
+
+# Download/transcript artifacts
+*.mp3
+*.srt
+*.vtt
+*.tsv
+*.json
+*.txt
+latest-transcript.txt
